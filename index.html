@@ -218,6 +218,20 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
   var CFG = null;
   try { CFG = JSON.parse(localStorage.getItem('agenda-cfg') || 'null'); } catch (e) {}
   var itens = [], filtro = 'todas', aba = 'lista', emVoo = {};
+  var fila = [];
+  try { fila = JSON.parse(localStorage.getItem('agenda-fila') || '[]'); } catch (e) {}
+  function salvaFila() { try { localStorage.setItem('agenda-fila', JSON.stringify(fila)); } catch (e) {} }
+  function tmpItens() {
+    return fila.map(function (q) {
+      var o = {}; Object.keys(q.item).forEach(function (k) { o[k] = q.item[k]; });
+      o.id = q.tmp; o.feito = false; o.feitoEm = ''; o.eventId = ''; o.horaFim = ''; o.origem = '';
+      o.criado = q.em; o.agenda = ''; o.pendenteEnvio = true;
+      return o;
+    });
+  }
+  function salvaCache() {
+    try { localStorage.setItem('agenda-cache', JSON.stringify(itens.filter(function (i) { return !i.pendenteEnvio; }))); } catch (e) {}
+  }
   var gDias = {}, gCarregando = {}, gErro = {};
   var agora = new Date();
   var mesVis = new Date(agora.getFullYear(), agora.getMonth(), 1);
@@ -267,6 +281,7 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
   function carregar(silencioso) {
     return api('list').then(function (r) {
       itens = (r.items || []).filter(function (o) { return o.titulo; });
+      salvaCache(); itens = itens.concat(tmpItens());
       carregado = true; banner(''); render();
     }, function (e) {
       if (!silencioso || !carregado) { banner(errText(e)); if (!carregado) $('resumo').textContent = 'Sem conexão'; }
@@ -275,6 +290,7 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
 
   /* ---------- ações ---------- */
   function alternar(it) {
+    if (it.pendenteEnvio) { aviso('Aguardando conexão para enviar este item.'); return; }
     if (emVoo[it.id]) return;
     emVoo[it.id] = true;
     var antes = it.feito, antesEm = it.feitoEm;
@@ -285,6 +301,10 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
     }).then(function () { emVoo[it.id] = false; });
   }
   function excluir(it) {
+    if (it.pendenteEnvio) {
+      fila = fila.filter(function (q) { return q.tmp !== it.id; }); salvaFila();
+      itens = itens.filter(function (x) { return x.id !== it.id; }); render(); return;
+    }
     api('remove', { id: it.id }).then(function (r) {
       itens = itens.filter(function (x) { return x.id !== it.id; });
       if (it.data) delete gDias[it.data.slice(0, 7)];
@@ -391,12 +411,13 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
     chip.appendChild(h('i', 'pt'));
     chip.appendChild(document.createTextNode(CATS[it.cat] || 'Geral'));
     meta.appendChild(chip);
+    if (it.pendenteEnvio) meta.appendChild(h('span', 'quando atrasada', 'aguardando conexão'));
     if (temData(it)) {
       var atras = !it.feito && it.data < hoje;
       meta.appendChild(h('span', 'quando' + (atras ? ' atrasada' : ''), rotulo(it.data) + (it.hora ? ' · ' + it.hora + (it.horaFim ? '–' + it.horaFim : '') : ' · dia todo')));
       if (it.agenda === 'enviado') {
         meta.appendChild(h('span', 'quando', 'no Google Agenda'));
-      } else if (!it.feito) {
+      } else if (!it.feito && !it.pendenteEnvio) {
         var tent = h('button', 'tentar', 'Enviar ao Google Agenda');
         tent.type = 'button';
         tent.addEventListener('click', function () {
@@ -632,9 +653,41 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
         aviso(r.agendaErro ? 'Lançado. Não foi para o Google Agenda: ' + r.agendaErro : 'Lançado e enviado ao Google Agenda.');
       } else aviso('Lançado.');
       render();
-    }).catch(function (err) { aviso('Não foi possível salvar. ' + errText(err)); })
-      .then(function () { btn.disabled = false; });
+    }).catch(function (err) {
+      if (err && err.code === 'server_unavailable') {
+        fila.push({ tmp: 'tmp' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), item: doc, em: new Date().toISOString() });
+        salvaFila();
+        itens.push(tmpItens().slice(-1)[0]);
+        $('txt').value = ''; $('hr').value = ''; $('dt').value = isoDe(new Date());
+        $('tipo-sem').checked = true; ajustaPrazo();
+        if (doc.data) { diaSel = doc.data; var d2 = dataDe(doc.data); mesVis = new Date(d2.getFullYear(), d2.getMonth(), 1); }
+        aviso('Sem internet: salvo no aparelho. Será enviado quando reconectar.');
+        render();
+      } else aviso('Não foi possível salvar. ' + errText(err));
+    }).then(function () { btn.disabled = false; });
   });
+
+  /* ---------- fila offline ---------- */
+  var sincFila = false;
+  function sincronizarFila() {
+    if (sincFila || !fila.length || !CFG || !CFG.url) return Promise.resolve();
+    sincFila = true;
+    var enviados = 0;
+    function proximo() {
+      if (!fila.length) return Promise.resolve();
+      return api('add', { item: fila[0].item }).then(function () { fila.shift(); salvaFila(); enviados++; return proximo(); });
+    }
+    return proximo().then(function () {
+      if (enviados) aviso(enviados + (enviados === 1 ? ' lançamento salvo offline foi enviado.' : ' lançamentos salvos offline foram enviados.'));
+    }, function (e) {
+      if (e && e.code !== 'server_unavailable') aviso('Não foi possível enviar os lançamentos salvos. ' + errText(e));
+    }).then(function () {
+      sincFila = false;
+      if (enviados) { gDias = {}; return carregar(true); }
+      render();
+    });
+  }
+  window.addEventListener('online', function () { sincronizarFila(); });
 
   /* ---------- conexão ---------- */
   function showSetup() {
@@ -663,10 +716,10 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
 
   function startApp() {
     $('setup').hidden = true; $('app').hidden = false;
-    gDias = {}; carregar(false);
+    gDias = {}; carregar(false).then(sincronizarFila);
     if (!started) {
       started = true;
-      var tick = function () { if (!document.hidden && !$('txt').value) carregar(true); };
+      var tick = function () { if (!document.hidden && !$('txt').value) sincronizarFila().then(function () { return carregar(true); }); };
       setInterval(tick, 45000);
       document.addEventListener('visibilitychange', tick);
     }
@@ -675,7 +728,12 @@ details.feitas ul.itens { border: 0; border-top: 1px solid var(--line); border-r
   try {
     $('data-hoje').textContent = new Intl.DateTimeFormat('pt-BR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date());
   } catch (e) { $('data-hoje').textContent = isoDe(new Date()); }
+  try {
+    var cc = JSON.parse(localStorage.getItem('agenda-cache') || 'null');
+    if ((cc && cc.length) || fila.length) { itens = (cc || []).concat(tmpItens()); carregado = true; }
+  } catch (e) {}
   render();
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});
   if (CFG && CFG.url && CFG.token) startApp(); else { $('resumo').textContent = 'Sem conexão'; showSetup(); }
 })();
 </script>
